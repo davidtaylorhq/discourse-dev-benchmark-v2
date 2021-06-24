@@ -1,0 +1,603 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+if !(ENV['RUBYOPT'] || "").include?("-W0")
+  ENV['RUBYOPT'] = "-W0"
+  exec __FILE__
+end
+
+require 'socket'
+require 'fileutils'
+require 'etc'
+require 'securerandom'
+require 'optparse'
+require 'benchmark'
+require 'tempfile'
+require 'open3'
+
+# Run a command. Only print output on non-zero exit status
+def run(*args)
+  out, status = Open3.capture2e(*args)
+  if status.exitstatus != 0
+    message = "Command exited with status #{status.exitstatus}: #{args.join(" ")}"
+    STDERR.puts "-" * 20
+    STDERR.puts message
+    STDERR.puts "Output:"
+    STDERR.puts out
+    STDERR.puts "-" * 20
+    raise message
+  end
+  out
+end
+
+# https://stackoverflow.com/questions/7749568/how-can-i-do-standard-deviation-in-ruby
+module Enumerable
+
+  def sum
+    self.inject(0) { |accum, i| accum + i }
+  end
+
+  def mean
+    self.sum / self.length.to_f
+  end
+
+  def sample_variance
+    m = self.mean
+    sum = self.inject(0) { |accum, i| accum + (i - m)**2 }
+    sum / (self.length - 1).to_f
+  end
+
+  def standard_deviation
+    Math.sqrt(self.sample_variance)
+  end
+
+end
+
+class DevBench
+
+  PATH = File.expand_path('..', __FILE__)
+  PG_PATH = "#{PATH}/data/pg"
+  PG_CONF = "#{PG_PATH}/postgresql.conf"
+  PG_SOCK_PATH = "#{PG_PATH}/sockets"
+  DB_DUMP = "#{PATH}/fixtures/db.dump"
+  DB_TEST_DUMP = "#{PATH}/fixtures/db_test.dump"
+  REDIS_PATH = "#{PATH}/data/redis"
+  REDIS_CONF = "#{PATH}/fixtures/redis/redis.conf"
+  RANDOM_PATH = "#{PATH}/data/random_files.noindex"
+  RANDOM_FILES = 5000
+  RANDOM_FILE_SIZE = 10_000
+
+  def pg_bin_path
+    return @pg_bin_path if @pg_bin_path
+
+    ["12", "11", "10"].each do |v|
+      bin_path = "/usr/lib/postgresql/#{v}/bin"
+      if File.exist?("#{bin_path}/pg_ctl")
+        @pg_bin_path = bin_path
+        break
+      end
+    end
+    if !@pg_bin_path
+      bin_path = "/Applications/Postgres.app/Contents/Versions/latest/bin"
+      if File.exists?("#{bin_path}/pg_ctl")
+        @pg_bin_path = bin_path
+      end
+    end
+    if !@pg_bin_path
+      puts "Can not find postgres bin path"
+      exit 1
+    end
+    @pg_bin_path
+  end
+
+  def port_available?(port)
+    TCPServer.open(port).close
+    true
+  rescue Errno::EADDRINUSE
+    false
+  end
+
+  def find_free_port(range)
+    range.each do |port|
+      return port if port_available?(port)
+    end
+  end
+
+  def pg_port
+    @pg_port ||= find_free_port(11000..11900)
+  end
+
+  def redis_port
+    @redis_port ||= find_free_port(12000..12900)
+  end
+
+  def redis_pid
+    @redis_pid
+  end
+
+  def set_redis_pid(pid)
+    @redis_pid = pid
+  end
+
+  def pg_ctl_path
+    return @pg_ctl_path if @pg_ctl_path
+
+    @pg_ctl_path = run('which pg_ctl 2> /dev/null').strip
+    if @pg_ctl_path.length == 0
+      @pg_ctl_path = "#{pg_bin_path}/pg_ctl"
+    end
+
+    @pg_ctl_path
+  end
+
+  def initdb_path
+    return @initdb_path if @initdb_path
+
+    @initdb_path = run('which initdb 2> /dev/null').strip
+    if @initdb_path.length == 0
+      @initdb_path = "#{pg_bin_path}/initdb"
+    end
+
+    @initdb_path
+  end
+
+  def start_postgres
+    FileUtils.rm_rf PG_PATH
+    run "#{initdb_path} -D '#{PG_PATH}' --auth-host=trust --locale=en_US.UTF-8 -E UTF8 2> /dev/null"
+
+    FileUtils.mkdir PG_SOCK_PATH
+    conf = File.read(PG_CONF)
+    File.write(PG_CONF, conf + "\nport = #{pg_port}\nunix_socket_directories = '#{PG_SOCK_PATH}'")
+
+    puts "Starting postgres on port: #{pg_port}"
+    ENV['PGPORT'] = pg_port.to_s
+    ENV['PGHOST'] = "localhost"
+
+    Thread.new do
+      run "#{pg_ctl_path} -D '#{PG_PATH}' start"
+    end
+
+    puts "Waiting for PG server to start..."
+    while !`#{pg_ctl_path} -D '#{PG_PATH}' status`.include?('server is running')
+      sleep 0.1
+    end
+
+    run "createuser -h localhost -p #{pg_port} -s -D -w sam 2> /dev/null"
+
+    run "createdb -h localhost -p #{pg_port} discourse_development"
+    run "psql -h localhost -p #{pg_port} discourse_development < '#{DB_DUMP}'"
+
+    run "createdb -h localhost -p #{pg_port} discourse_test"
+    run "psql -h localhost -p #{pg_port} discourse_test < '#{DB_TEST_DUMP}'"
+
+    run "bin/rake db:migrate"
+    run "SKIP_MULTISITE=1 RAILS_ENV=test bin/rake db:migrate"
+
+    puts "PG server is ready and DB is loaded"
+  end
+
+  def stop_redis
+    # print "Stopping redis #{redis_pid} ..."
+    Process.kill('QUIT', redis_pid)
+    Process.waitpid(redis_pid)
+    # puts " stopped"
+  end
+
+  def start_redis
+    `rm -fr '#{REDIS_PATH}/dump.rdb'`
+    `mkdir -p '#{REDIS_PATH}'`
+    set_redis_pid(
+      Process.spawn(
+        "redis-server",
+        REDIS_CONF,
+        '--port',
+        redis_port.to_s,
+        '--dir',
+        REDIS_PATH,
+        out: '/dev/null'
+      )
+    )
+    ENV['DISCOURSE_REDIS_PORT'] = redis_port.to_s
+
+    puts "Redis server is started in pid #{redis_pid} port: #{redis_port}"
+  end
+
+  def measure(iterations: 10, warmup: 4, min_duration: 10)
+    iterations += warmup
+
+    total_duration = 0
+    since_gc = 0
+
+    durations = []
+
+    while (iterations > 0 || min_duration > total_duration)
+      GC.disable
+      start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      yield
+      finish = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      GC.enable
+
+      duration = finish - start
+
+      if @verbose
+        puts "duration: #{(duration * 1000)}ms"
+      end
+
+      since_gc += duration
+
+      if since_gc > 0.3
+        GC.start
+        since_gc = 0
+      end
+
+      if (warmup -= 1) < 0
+        durations << duration
+        total_duration += duration
+      end
+
+      iterations -= 1
+    end
+
+    [durations.mean, durations.standard_deviation]
+  end
+
+  def measure_in_fork(**args)
+    means = []
+    deviations = []
+
+    threads = args.delete(:threads)
+
+    (1..threads).map do
+      Thread.new do
+        r, w = IO.pipe
+
+        pid = fork do
+          require File.expand_path('../config/environment', __FILE__)
+          mean, deviation = measure(**args) do
+            yield
+          end
+          r.close
+          w.puts mean.to_s
+          w.puts deviation.to_s
+        end
+
+        w.close
+
+        Process.wait pid
+
+        mean, deviation = r.read.split("\n")
+
+        r.close
+
+        means << mean.to_f
+        deviations << deviation.to_f
+      end
+    end.each(&:join)
+
+    [means.mean / threads.to_f, deviations.mean / threads.to_f]
+  end
+
+  def format(desc, result, mode: :ops)
+    mean, deviation = result
+    per_sec = 1.0 / mean
+
+    percent = (deviation / mean) * 100
+
+    if mode == :secs
+      puts "#{desc}: #{mean.round(3)} (±#{percent.round(1)}%) seconds"
+    else
+      puts "#{desc}: #{per_sec.round(3)} (±#{percent.round(1)}%) op/s"
+    end
+  end
+
+  def self.post_body
+    <<~TEXT
+      I am some random post body, **I have some bold**
+
+      I have some lines
+
+      And I have the this in it #{SecureRandom.hex}
+    TEXT
+  end
+
+  def self.test(name, **options, &blk)
+    @@tests ||= []
+    @@tests << [name, options, blk]
+  end
+
+  def self.single_thread_test(name, **args, &blk)
+    args[:single_thread] = true
+    test(name, **args, &blk)
+  end
+
+  test("Topic View", warmup: 15) do
+    req = {
+      "REQUEST_METHOD" => "GET",
+      "SCRIPT_NAME" => "",
+      "PATH_INFO" => "/t/this-is-an-amazing-first-topic/11",
+      "QUERY_STRING" => "",
+      "SERVER_NAME" => "localhost",
+      "HTTP_HOST" => "localhost",
+      "SERVER_PORT" => "80",
+      "REQUEST_PATH" => "/",
+      "REMOTE_ADDR" => "127.0.0.1",
+      "HTTP_VERSION" => "HTTP/1.0",
+      "rack.input" => StringIO.new(""),
+      "rack.version" => [1, 2],
+      "rack.url_scheme" => "http"
+    }
+    
+    result = Rails.application.call(req)
+    if result[0] != 200
+      raise "Topic route responded with status #{result[0]}" 
+    end
+  end
+
+  single_thread_test "Topic Create" do
+    Jobs.run_immediately!
+
+    PostCreator.create(
+      Discourse.system_user,
+      raw: post_body,
+      title: "I am a title #{SecureRandom.hex}",
+      skip_validations: true
+    )
+  end
+
+  single_thread_test("Post Spec", warmup: 1, iterations: 2, mode: :secs) do
+    run "bin/rspec spec/models/post_spec.rb --seed 1"
+  end
+
+  test "PBKdf2 64000 sha256" do
+    Pbkdf2.hash_password(SecureRandom.hex, SecureRandom.hex, 64000, "sha256")
+  end
+
+  def self.readme_md
+    @readme_md ||= File.read("README.md")
+  end
+
+  test("Cook README.md", warmup: 30) do
+    PrettyText.cook(readme_md)
+  end
+
+  test("Discourse Boot", mode: :secs, warmup: 1, iterations: 4) do
+    run "bin/rails r Post.first"
+  end
+
+  def self.random_file_init
+    puts "Creating random files for IO tests"
+    @random_file_seed = Random.new(1)
+
+    `rm -rf '#{RANDOM_PATH}'`
+    `mkdir -p '#{RANDOM_PATH}'`
+    (0..RANDOM_FILES).each do |i|
+      File.write("#{RANDOM_PATH}/#{i}", SecureRandom.hex(RANDOM_FILE_SIZE / 2))
+    end
+  end
+
+  def self.random_file
+    filenumber = (@random_file_seed.rand * RANDOM_FILES).to_i
+    "#{RANDOM_PATH}/#{filenumber}"
+  end
+
+  test("Random Read") do
+    begin
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+      File.read(random_file)
+    rescue => e
+      p e
+    end
+  end
+
+  def run_tests(threads = 1)
+    puts
+    puts "Running benchmark on #{threads} core#{threads > 1 ? "s" : "" }"
+    puts "-" * 20
+    puts
+
+    @@tests.each do |name, args, blk|
+      next if @test && @test[0] != name
+      args = args.dup
+      single_thread = args.delete(:single_thread)
+      mode = args.delete(:mode) || :ops
+      args[:threads] = threads
+
+      if threads == 1 || !single_thread
+        result = measure_in_fork(**args, &blk)
+        format(name, result, mode: mode)
+      end
+    end
+  end
+
+  def about
+    begin
+      require 'facter'
+      raise LoadError if Gem::Version.new(Facter.version) < Gem::Version.new("4.0")
+    rescue LoadError
+      puts "Installing facter to gather system info, please re-run"
+      run "gem install facter"
+      exit
+    end
+
+    Facter.reset
+    facts = Facter.to_hash
+
+    cores = Etc.nprocessors
+    facts.delete_if { |k, v|
+      !["operatingsystem", "architecture", "kernelversion",
+      "memorysize", "physicalprocessorcount", "processor0",
+      "virtual"].include?(k)
+    }
+
+    puts
+    puts
+    puts "System Info"
+    puts "-" * 20
+
+    facts.each do |k, v|
+      puts "#{k}: #{v}"
+    end
+    puts "cores: #{cores}"
+    puts "ruby: #{RUBY_VERSION}"
+    puts `#{pg_ctl_path} --version`
+    puts `redis-server --version`
+
+    if File.size(`which ruby`.strip) < 500_000
+      puts "ruby likely running via a shim, consider chruby for faster boot"
+    else
+      puts "ruby: no shim"
+    end
+
+    puts "discourse: #{run('git rev-parse HEAD').strip}"
+
+    puts
+  end
+
+  def stop_postgres
+    `#{pg_ctl_path} -D '#{PG_PATH}' stop`
+  end
+
+  def initialize
+    parse_args
+  end
+
+  def parse_args
+    opts = OptionParser.new do |o|
+      o.banner = "Usage: ./bench [options]"
+
+      o.on("-v", "--verbose", "Verbose output") do
+        @verbose = true
+      end
+
+      o.on("-s", "--single", "Only run single process benchmarks") do
+        @single = true
+      end
+      o.on("-t", "--test [STRING]", "Run a single test") do |t|
+        @test = @@tests.find { |name, _| name == t }
+        if !@test
+          raise OptionParser::InvalidArgument, "Can not find test"
+        end
+      end
+      o.on("-p", "--profile [STRING]", "Run a single test in profile mode") do |s|
+        @profiled_test = @@tests.find { |name, _| name == s }
+        if !@profiled_test
+          raise OptionParser::InvalidArgument, "Can not find test"
+        end
+      end
+    end
+    begin
+      opts.parse!
+    rescue => e
+      puts
+      puts e.message
+      puts
+      puts opts.help
+      exit 1
+    end
+
+  end
+
+  def profile_test
+    name, _, blk = @profiled_test
+
+    puts "Profiling #{name}"
+    puts
+
+    pid = fork do
+      require File.expand_path('../config/environment', __FILE__)
+
+      Scheduler::Defer.async = false
+
+      MethodProfiler.ensure_discourse_instrumentation!
+
+      100.times do |i|
+        GC.disable
+        MethodProfiler.start
+        blk.call
+        result = MethodProfiler.stop
+
+        redis_duration = (result.dig(:redis, :duration).to_f * 1000).round(2)
+        redis_calls = result.dig(:redis, :calls) || 0
+        sql_duration = (result.dig(:sql, :duration).to_f * 1000).round(2)
+        sql_calls = result.dig(:sql, :calls) || 0
+
+        puts "Run #{i}: #{(result[:total_duration] * 1000).round(2)}ms (sql: #{sql_duration}ms - #{sql_calls} calls, redis: #{redis_duration}ms - #{redis_calls} calls)"
+        GC.enable
+        GC.start
+      end
+
+      puts
+      GC.disable
+      Benchmark.bm do |x|
+        x.report(name) do
+          blk.call
+        end
+      end
+      GC.enable
+
+      require 'stackprof'
+      tmp = Tempfile.new('prof')
+      tmp.close
+
+      GC.disable
+      StackProf.run(mode: :wall, out: tmp.path) do
+        blk.call
+      end
+      GC.enable
+
+      puts "Stackprof report"
+      StackProf::Report.new(Marshal.load(IO.binread(tmp.path))).print_text
+
+      tmp.unlink
+
+    end
+
+    Process.wait pid
+  end
+
+  def clear_env
+    ENV.each do |k, v|
+      ENV.delete k if k.start_with? "DISCOURSE"
+    end
+  end
+
+  def test_it
+    clear_env
+    start_redis
+    start_postgres
+    self.class.random_file_init
+
+    if @profiled_test
+      profile_test
+    else
+      run_tests
+
+      if !@single
+        run_tests(Etc.nprocessors)
+      end
+    end
+
+    about
+  ensure
+    stop_redis
+    stop_postgres
+  end
+end
+
+puts "Ensuring discourse submodule is checked out..."
+run "git submodule init"
+run "git submodule update"
+FileUtils.cd("discourse") do
+  puts "Ensuring gems are installed..."
+  run "bundle install"
+  DevBench.new.test_it
+end
