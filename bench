@@ -122,8 +122,9 @@ class DevBench
   def pg_ctl_path
     return @pg_ctl_path if @pg_ctl_path
 
-    @pg_ctl_path = run('which pg_ctl 2> /dev/null').strip
-    if @pg_ctl_path.length == 0
+    begin
+      @pg_ctl_path = run('which pg_ctl 2> /dev/null').strip
+    rescue
       @pg_ctl_path = "#{pg_bin_path}/pg_ctl"
     end
 
@@ -133,8 +134,9 @@ class DevBench
   def initdb_path
     return @initdb_path if @initdb_path
 
-    @initdb_path = run('which initdb 2> /dev/null').strip
-    if @initdb_path.length == 0
+    begin
+      @initdb_path = run('which initdb 2> /dev/null').strip
+    rescue
       @initdb_path = "#{pg_bin_path}/initdb"
     end
 
