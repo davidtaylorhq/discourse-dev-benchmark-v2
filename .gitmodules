@@ -1,4 +1,5 @@
 [submodule "discourse"]
 	path = discourse
-	url = git@github.com:discourse/discourse
+	url = https://github.com/discourse/discourse
+	branch = main
 	shallow = true
